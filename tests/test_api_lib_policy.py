@@ -46,7 +46,8 @@ from privacyidea.api.lib.prepolicy import (check_token_upload,
                                            check_admin_tokenlist, pushtoken_disable_wait,
                                            webauthntoken_auth, webauthntoken_authz,
                                            webauthntoken_enroll, webauthntoken_request,
-                                           webauthntoken_allowed, check_application_tokentype)
+                                           webauthntoken_allowed, check_application_tokentype,
+                                           required_piv_attestation, check_custom_user_attributes)
 from privacyidea.lib.realm import set_realm as create_realm
 from privacyidea.lib.realm import delete_realm
 from privacyidea.api.lib.postpolicy import (check_serial, check_tokentype,
@@ -2964,7 +2965,32 @@ class PrePolicyDecoratorTestCase(MyApiTestCase):
         # Check that the tokentype was removed
         self.assertEqual(req.all_data.get("type"), None)
 
-    def test_35_init_registrationcode_length_contents(self):
+    def test_35_require_piv_attestation(self):
+        from privacyidea.lib.tokens.certificatetoken import ACTION, REQUIRE_ACTIONS
+        builder = EnvironBuilder(method='POST',
+                                 data={'user': "cornelius"},
+                                 headers={})
+        env = builder.get_environ()
+        # Set the remote address so that we can filter for it
+        env["REMOTE_ADDR"] = "10.0.0.1"
+        g.client_ip = env["REMOTE_ADDR"]
+        req = Request(env)
+
+        # Set a policy, that the application is allowed to specify tokentype
+        set_policy(name="pol1",
+                   scope=SCOPE.ENROLL,
+                   action="{0!s}={1!s}".format(ACTION.REQUIRE_ATTESTATION, REQUIRE_ACTIONS.REQUIRE_AND_VERIFY))
+        g.policy_object = PolicyClass()
+
+        # provide an empty attestation
+        req.all_data = {"attestation": "",
+                        "type": "certificate"}
+        req.User = User("cornelius", self.realm1)
+        # This will fail, since the attestation is required.
+        self.assertRaises(PolicyError, required_piv_attestation, req)
+        delete_policy("pol1")
+
+    def test_36_init_registrationcode_length_contents(self):
         g.logged_in_user = {"username": "admin1",
                             "realm": "",
                             "role": "admin"}
@@ -2997,6 +3023,92 @@ class PrePolicyDecoratorTestCase(MyApiTestCase):
         # delete policy
         delete_policy("reg_length")
         delete_policy("reg_contents")
+
+    def test_40_custom_user_attributes(self):
+        g.logged_in_user = {"username": "admin1",
+                            "realm": "",
+                            "role": "admin"}
+        builder = EnvironBuilder(method='POST',
+                                 data={'type': "registration"},
+                                 headers={})
+        env = builder.get_environ()
+        req = Request(env)
+        req.User = User("cornelius", self.realm1)
+
+        # first test without any policy to delete the department. This is not allowed
+        req.all_data = {"user": "cornelius", "realm": self.realm1, "attrkey": "department"}
+        self.assertRaisesRegexp(PolicyError,
+                                "ERR303: You are not allowed to delete the custom user attribute department!",
+                                check_custom_user_attributes, req, "delete")
+
+        # set to allow deleting the department
+        set_policy("set_custom_attr", scope=SCOPE.ADMIN,
+                   action="{0!s}=department sth".format(ACTION.DELETE_USER_ATTRIBUTES))
+        req.all_data = {"user": "cornelius", "realm": self.realm1, "attrkey": "department"}
+        check_custom_user_attributes(req, "delete")
+
+        # Now try to delete a different key
+        req.all_data = {"user": "cornelius", "realm": self.realm1, "attrkey": "difkey"}
+        self.assertRaises(PolicyError, check_custom_user_attributes, req, "delete")
+
+        # Allow to delete diffkey
+        set_policy("set_custom_attr2", scope=SCOPE.ADMIN,
+                   action="{0!s}=difkey".format(ACTION.DELETE_USER_ATTRIBUTES))
+        req.all_data = {"user": "cornelius", "realm": self.realm1, "attrkey": "difkey"}
+        check_custom_user_attributes(req, "delete")
+
+        # Now we set the policy to allow to delete any attribute
+        set_policy("set_custom_attr2", scope=SCOPE.ADMIN,
+                   action="{0!s}=*".format(ACTION.DELETE_USER_ATTRIBUTES))
+        req.all_data = {"user": "cornelius", "realm": self.realm1, "attrkey": "department"}
+        check_custom_user_attributes(req, "delete")
+        req.all_data = {"user": "cornelius", "realm": self.realm1, "attrkey": "anykey"}
+        check_custom_user_attributes(req, "delete")
+
+        """
+        set custom attributes
+        """
+        # no policy set
+        req.all_data = {"user": "cornelius", "realm": self.realm1,
+                        "key": "department", "value": "finance"}
+        self.assertRaises(PolicyError, check_custom_user_attributes, req, "set")
+        set_policy("set_custom_attr", scope=SCOPE.ADMIN,
+                   action="{0!s}=:department: finance devel :color: * :*: 1 2 ".format(ACTION.SET_USER_ATTRIBUTES))
+        # Allow to set to finance
+        check_custom_user_attributes(req, "set")
+        req.all_data = {"user": "cornelius", "realm": self.realm1,
+                        "key": "department", "value": "devel"}
+        check_custom_user_attributes(req, "set")
+        # You are not allowed to set a different department
+        req.all_data = {"user": "cornelius", "realm": self.realm1,
+                        "key": "department", "value": "different"}
+        self.assertRaisesRegexp(PolicyError,
+                                "ERR303: You are not allowed to set the custom user attribute department!",
+                                check_custom_user_attributes, req, "set")
+
+        # You are allowed to set color to any value
+        req.all_data = {"user": "cornelius", "realm": self.realm1,
+                        "key": "color", "value": "blue"}
+        check_custom_user_attributes(req, "set")
+
+        # You are allowed to set any other value to 1 or 2
+        req.all_data = {"user": "cornelius", "realm": self.realm1,
+                        "key": "size", "value": "1"}
+        check_custom_user_attributes(req, "set")
+        req.all_data = {"user": "cornelius", "realm": self.realm1,
+                        "key": "size", "value": "2"}
+        check_custom_user_attributes(req, "set")
+        # But not to another value
+        req.all_data = {"user": "cornelius", "realm": self.realm1,
+                        "key": "size", "value": "3"}
+        self.assertRaises(PolicyError, check_custom_user_attributes, req, "set")
+
+        # Now you can set any key to any value
+        set_policy("set_custom_attr2", scope=SCOPE.ADMIN,
+                   action="{0!s}=:*: *".format(ACTION.SET_USER_ATTRIBUTES))
+        req.all_data = {"user": "cornelius", "realm": self.realm1,
+                        "key": "size", "value": "3"}
+        check_custom_user_attributes(req, "set")
 
 
 class PostPolicyDecoratorTestCase(MyApiTestCase):

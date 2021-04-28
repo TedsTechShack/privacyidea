@@ -69,7 +69,7 @@ from privacyidea.api.lib.prepolicy import (is_remote_user_allowed, prepolicy,
                                            webauthntoken_auth)
 from privacyidea.api.lib.utils import (send_result, get_all_params,
                                        verify_auth_token, getParam)
-from privacyidea.lib.utils import get_client_ip, hexlify_and_unicode
+from privacyidea.lib.utils import get_client_ip, hexlify_and_unicode, to_unicode
 from privacyidea.lib.config import get_from_config, SYSCONF, ensure_no_config_object
 from privacyidea.lib.event import event, EventConfiguration
 from privacyidea.lib import _
@@ -97,6 +97,9 @@ def before_request():
     # access_route contains the ip adresses of all clients, hops and proxies.
     g.client_ip = get_client_ip(request,
                                 get_from_config(SYSCONF.OVERRIDECLIENT))
+    # Save the HTTP header in the localproxy object
+    g.request_headers = request.headers
+    g.serial = getParam(request.all_data, "serial", default=None)
     g.audit_object.log({"success": False,
                         "client": g.client_ip,
                         "client_user_agent": request.user_agent.browser,
@@ -364,11 +367,11 @@ def get_auth_token():
                         "authtype": authtype,
                         "exp": datetime.utcnow() + validity,
                         "rights": rights},
-                       secret, algorithm='HS256').decode('utf8')
+                       secret, algorithm='HS256')
 
     # Add the role to the response, so that the WebUI can make decisions
     # based on this (only show selfservice, not the admin part)
-    return send_result({"token": token,
+    return send_result({"token": to_unicode(token),
                         "role": role,
                         "username": loginname,
                         "realm": realm,

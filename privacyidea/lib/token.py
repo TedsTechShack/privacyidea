@@ -68,6 +68,8 @@ import logging
 from six import string_types
 
 from sqlalchemy import (and_, func)
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.sql import expression
 
 from privacyidea.lib.error import (TokenAdminError,
                                    ParameterError,
@@ -108,6 +110,23 @@ required = False
 
 ENCODING = "utf-8"
 
+
+# Define function to convert Oracle CLOBs to VARCHAR before using them in a
+# compare operation.
+# By using <https://docs.sqlalchemy.org/en/13/core/compiler.html> we can
+# differentiate between different dialects.
+class clob_to_varchar(expression.FunctionElement):
+    name = 'clob_to_varchar'
+
+
+@compiles(clob_to_varchar)
+def fn_clob_to_varchar_default(element, compiler, **kw):
+    return compiler.process(element.clauses, **kw)
+
+
+@compiles(clob_to_varchar, 'oracle')
+def fn_clob_to_varchar_oracle(element, compiler, **kw):
+    return "to_char(%s)" % compiler.process(element.clauses, **kw)
 
 @log_with(log)
 def create_tokenclass_object(db_token):
@@ -287,7 +306,7 @@ def _create_token_query(tokentype=None, realm=None, assigned=None, user=None,
             raise privacyIDEAError("I can only create SQL filters from "
                                    "tokeninfo of length 1.")
         sql_query = sql_query.filter(TokenInfo.Key == list(tokeninfo)[0])
-        sql_query = sql_query.filter(TokenInfo.Value == list(tokeninfo.values())[0])
+        sql_query = sql_query.filter(clob_to_varchar(TokenInfo.Value) == list(tokeninfo.values())[0])
         sql_query = sql_query.filter(TokenInfo.token_id == Token.id)
 
     return sql_query
@@ -921,7 +940,7 @@ def gen_serial(tokentype=None, prefix=None):
 
 
 @log_with(log)
-def import_token(serial, token_dict, default_hashlib=None, tokenrealms=None):
+def import_token(serial, token_dict, tokenrealms=None):
     """
     This function is used during the import of a PSKC file.
 
@@ -940,8 +959,6 @@ def import_token(serial, token_dict, default_hashlib=None, tokenrealms=None):
             }
 
     :type token_dict: dict
-    :param default_hashlib: Set the given hashlib as default
-    :type default_hashlib: str
     :param tokenrealms: List of realms to set as realms of the token
     :type tokenrealms: list
     :return: the token object
@@ -958,9 +975,6 @@ def import_token(serial, token_dict, default_hashlib=None, tokenrealms=None):
         user_obj = User(token_dict.get("user").get("username"),
                         token_dict.get("user").get("realm"),
                         token_dict.get("user").get("resolver"))
-
-    if default_hashlib and default_hashlib != "auto":
-        init_param['hashlib'] = default_hashlib
 
     # Imported tokens are usually hardware tokens
     token = init_token(init_param, user=user_obj,
@@ -1062,8 +1076,7 @@ def init_token(param, user=None, tokenrealms=None,
     if user is not None and user.login != "":
         tokenobject.add_user(user)
 
-    upd_params = param
-    tokenobject.update(upd_params)
+    tokenobject.update(param)
 
     try:
         # Save the token to the database
@@ -2108,6 +2121,23 @@ def create_challenges_from_tokens(token_list, reply_dict, options=None):
     reply_dict["transaction_ids"] = [chal.get("transaction_id") for chal in reply_dict.get("multi_challenge", [])]
 
 
+def weigh_token_type(token_obj):
+    """
+    This method returns a weight of a token type, which is used
+    to sort the tokentype list. Other weighing functions can be implemented.
+
+    The Push token weighs the most, so that it will be sorted to the end.
+
+    :param token_obj: token object
+    :return: weight of the tokentype
+    :rtype: int
+    """
+    if token_obj.type.upper() == "PUSH":
+        return 1000
+    else:
+        return ord(token_obj.type[0])
+
+
 @log_with(log)
 @libpolicy(reset_all_user_tokens)
 @libpolicy(generic_challenge_response_reset_pin)
@@ -2160,7 +2190,7 @@ def check_token_list(tokenobject_list, passw, user=None, options=None, allow_res
             raise TokenAdminError(_("This action is not possible, since the "
                                     "token is locked"), id=1007)
 
-    for tokenobject in tokenobject_list:
+    for tokenobject in sorted(tokenobject_list, key=weigh_token_type):
         if log.isEnabledFor(logging.DEBUG):
             # Avoid a SQL query triggered by ``tokenobject.user`` in case
             # the log level is not DEBUG
@@ -2182,6 +2212,9 @@ def check_token_list(tokenobject_list, passw, user=None, options=None, allow_res
         else:
             # This is a normal authentication attempt
             try:
+                # pass the length of the valid_token_list to ``authenticate`` so that
+                # the push token can react accordingly
+                options["valid_token_num"] = len(valid_token_list)
                 pin_match, otp_count, repl = \
                     tokenobject.authenticate(passw, user, options=options)
             except TokenAdminError as tae:

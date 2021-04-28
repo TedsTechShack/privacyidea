@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 #
+#  2021-02-01 Cornelius Kölbel <cornelius.koelbel@netknights.it>
+#             Add custom user attributes
 #  2020-06-05 Cornelius Kölbel <cornelius.koelbel@netknights.it>
 #             Add privacyIDEA nodes
 #  2019-09-26 Friedrich Weber <friedrich.weber@netknights.it>
@@ -169,7 +171,7 @@ from configobj import ConfigObj
 from operator import itemgetter
 import six
 import logging
-from ..models import (Policy, db, save_config_timestamp)
+from ..models import (Policy, db, save_config_timestamp, Token)
 from privacyidea.lib.config import (get_token_classes, get_token_types,
                                     get_config_object, get_privacyidea_node)
 from privacyidea.lib.framework import get_app_config_value
@@ -180,7 +182,7 @@ from privacyidea.lib.smtpserver import get_smtpservers
 from privacyidea.lib.radiusserver import get_radiusservers
 from privacyidea.lib.utils import (check_time_in_range, check_pin_contents,
                                    fetch_one_resource, is_true, check_ip_in_policy,
-                                   determine_logged_in_userparams)
+                                   determine_logged_in_userparams, parse_string_to_dict)
 from privacyidea.lib.utils.compare import compare_values, CompareError, COMPARATOR_FUNCTIONS, COMPARATORS, \
     COMPARATOR_DESCRIPTIONS
 from privacyidea.lib.user import User
@@ -198,6 +200,7 @@ required = False
 
 DEFAULT_ANDROID_APP_URL = "https://play.google.com/store/apps/details?id=it.netknights.piauthenticator"
 DEFAULT_IOS_APP_URL = "https://apps.apple.com/us/app/privacyidea-authenticator/id1445401301"
+
 
 class SCOPE(object):
     __doc__ = """This is the list of the allowed scopes that can be used in
@@ -363,6 +366,15 @@ class ACTION(object):
     SHOW_IOS_AUTHENTICATOR = "show_ios_privacyidea_authenticator"
     SHOW_CUSTOM_AUTHENTICATOR = "show_custom_authenticator"
     AUTHORIZED = "authorized"
+    SHOW_NODE = "show_node"
+    SET_USER_ATTRIBUTES = "set_custom_user_attributes"
+    DELETE_USER_ATTRIBUTES = "delete_custom_user_attributes"
+
+
+class TYPE(object):
+    INT = "int"
+    STRING = "str"
+    BOOL = "bool"
 
 
 class AUTHORIZED(object):
@@ -435,6 +447,8 @@ class TIMEOUT_ACTION(object):
 class CONDITION_SECTION(object):
     __doc__ = """This is a list of available sections for conditions of policies """
     USERINFO = "userinfo"
+    TOKENINFO = "tokeninfo"
+    TOKEN = "token"
     HTTP_REQUEST_HEADER = "HTTP Request header"
 
 
@@ -656,7 +670,7 @@ class PolicyClass(object):
     def match_policies(self, name=None, scope=None, realm=None, active=None,
                        resolver=None, user=None, user_object=None, pinode=None,
                        client=None, action=None, adminrealm=None, adminuser=None, time=None,
-                       sort_by_priority=True, audit_data=None, request_headers=None):
+                       sort_by_priority=True, audit_data=None, request_headers=None, serial=None):
         """
         Return all policies matching the given context.
         Optionally, write the matching policies to the audit log.
@@ -725,7 +739,8 @@ class PolicyClass(object):
         log.debug("Policies after matching time: {0!s}".format([p.get("name") for p in reduced_policies]))
 
         # filter policies by the policy conditions
-        reduced_policies = self.filter_policies_by_conditions(reduced_policies, user_object, request_headers)
+        reduced_policies = self.filter_policies_by_conditions(reduced_policies, user_object, request_headers,
+                                                              serial)
         log.debug("Policies after matching conditions".format([p.get("name") for p in reduced_policies]))
 
         if audit_data is not None:
@@ -734,7 +749,7 @@ class PolicyClass(object):
 
         return reduced_policies
 
-    def filter_policies_by_conditions(self, policies, user_object=None, request_headers=None):
+    def filter_policies_by_conditions(self, policies, user_object=None, request_headers=None, serial=None):
         """
         Given a list of policy dictionaries and a current user object (if any),
         return a list of all policies whose conditions match the given user object.
@@ -746,12 +761,28 @@ class PolicyClass(object):
         :return: generates a list of policy dictionaries
         """
         reduced_policies = []
+        # If we have several token specific conditions, we only create the db_token (query token DB) once.
+        dbtoken = None
         for policy in policies:
             include_policy = True
             for section, key, comparator, value, active in policy['conditions']:
                 if active:
                     if section == CONDITION_SECTION.USERINFO:
-                        if not self._policy_matches_userinfo_condition(policy, key, comparator, value, user_object):
+                        if not self._policy_matches_info_condition(policy, key, comparator, value,
+                                                                   CONDITION_SECTION.USERINFO,
+                                                                   user_object=user_object):
+                            include_policy = False
+                            break
+                    elif section == CONDITION_SECTION.TOKENINFO:
+                        dbtoken = dbtoken or Token.query.filter(Token.serial == serial).first() if serial else None
+                        if not self._policy_matches_info_condition(policy, key, comparator, value,
+                                                                   CONDITION_SECTION.TOKENINFO,
+                                                                   dbtoken=dbtoken):
+                            include_policy = False
+                            break
+                    elif section == CONDITION_SECTION.TOKEN:
+                        dbtoken = dbtoken or Token.query.filter(Token.serial == serial).first() if serial else None
+                        if not self._policy_matches_token_condition(policy, key, comparator, value, dbtoken):
                             include_policy = False
                             break
                     elif section == CONDITION_SECTION.HTTP_REQUEST_HEADER:
@@ -792,54 +823,97 @@ class PolicyClass(object):
                 raise PolicyError(u"Unknown HTTP header key referenced in condition of policy "
                                   u"{!r}: {!r}".format(policy["name"], key))
         else:  # pragma: no cover
-            log.error(u"Policy {!r} has conditions on headers {!r}, but http header"
-                      u" is not available. This should not happen.".format(policy["name"], key))
-            raise PolicyError(u"Policy {!r} has conditions on headers {!r}, but http header"
-                        u" is not available".format(policy["name"], key))
+            log.error(u"Policy {!r} has conditions on HTTP headers, but HTTP header"
+                      u" is not available. This should not happen - possible "
+                      u"programming error {!s}.".format(policy["name"],
+                                                        ''.join(traceback.format_stack())))
+            raise PolicyError(u"Policy {!r} has conditions on headers {!r}, but HTTP header"
+                              u" is not available".format(policy["name"], key))
 
     @staticmethod
-    def _policy_matches_userinfo_condition(policy, key, comparator, value, user_object):
+    def _policy_matches_token_condition(policy, key, comparator, value, db_token):
         """
-        Check if the given policy matches a certain userinfo condition.
-        If ``user_object`` is None, a PolicyError is raised.
+        This extended policy checks for token attributes, which are existing columns in
+        the token DB table.
+
         :param policy: a policy dictionary, the policy in question
-        :param key: a userinfo key
+        :param key: the column name of the token
         :param comparator: a value comparator: one of "equal", "contains"
-        :param value: a value against which the userinfo value will be compared
+        :param value: a value against which the token value will be compared
+        :param db_token: a dbtoken object
+        :return: bool
+        """
+        if db_token:
+            if key in db_token.get():
+                try:
+                    return compare_values(db_token.get(key), comparator, value)
+                except Exception as exx:
+                    log.warning(u"Error during handling the condition on token {!r} "
+                                u"of policy {!r}: {!r}".format(key, policy['name'], exx))
+                    raise PolicyError(
+                        u"Invalid comparison in the {!s} conditions of policy {!r}".format(type, policy['name']))
+            else:
+                log.warning(u"Unknown token column referenced in a "
+                            u"condition of policy {!r}: {!r}".format(policy['name'], key))
+                # If we do have token object but the referenced key is not an attribute of the token,
+                # we have a misconfiguration and raise an error.
+                raise PolicyError(u"Unknown key in the token conditions of policy {!r}".format(policy['name']))
+        else:  # pragma: no cover
+            log.error(u"Policy {!r} has conditions on tokens, but a token object"
+                      u" is not available. This should not happen - possible programming "
+                      u"error: {!s}.".format(policy["name"], ''.join(traceback.format_stack())))
+            raise PolicyError(u"Policy {!r} has conditions on tokens, but a token object"
+                              u" is not available".format(policy["name"]))
+
+    @staticmethod
+    def _policy_matches_info_condition(policy, key, comparator, value, type, user_object=None, dbtoken=None):
+        """
+        Check if the given policy matches a certain userinfo or tokeninfo condition depending
+        on the specified ``type``.
+        For the userinfo, if ``user_object`` is None or the requested ``key`` is not contained,
+        a PolicyError is raised.
+        In case of a tokeninfo, no exception is raised if ``dbtoken`` is malformed. Instead, the
+        condition is effectively set to True and the policy may apply.
+        :param policy: a policy dictionary, the policy in question
+        :param key: a tokeninfo or userinfo key
+        :param comparator: a value comparator: one of "equal", "contains"
+        :param value: a value against which the tokeninfo or userinfo value will be compared
+        :param type: the info type to match, "userinfo" or "tokeninfo"
         :param user_object: a User object, if any, or None
+        :param dbtoken: a dbtoken object, if any, or None
         :return: a Boolean
         """
-        # Match the user object's user info, if it is not-None and non-empty
-        if user_object is not None:
-            info = user_object.info
+        if user_object is not None or dbtoken is not None:
+            info = user_object.info if user_object is not None else dbtoken.get_info()
+
             if key in info:
                 try:
                     return compare_values(info[key], comparator, value)
                 except Exception as exx:
-                    log.warning(u"Error during handling the condition on userinfo {!r} of policy {!r}: {!r}".format(
-                        key, policy['name'], exx
+                    log.warning(u"Error during handling the condition on {!s} {!r} of policy {!r}: {!r}".format(
+                        type, key, policy['name'], exx
                     ))
                     raise PolicyError(
-                        u"Invalid comparison in the userinfo conditions of policy {!r}".format(policy['name']))
+                        u"Invalid comparison in the {!s} conditions of policy {!r}".format(type, policy['name']))
             else:
-                # If we do have a user object, but the conditions of policies reference
-                # an unknown userinfo key, we have a misconfiguration and raise an error.
-                log.warning(u"Unknown userinfo key referenced in a condition of policy {!r}: {!r}".format(
-                    policy['name'], key
+                log.warning(u"Unknown {!s} key referenced in a condition of policy {!r}: {!r}".format(
+                    type, policy['name'], key
                 ))
-                raise PolicyError(u"Unknown key in the userinfo conditions of policy {!r}".format(
-                    policy['name']
+                # If we do have an user or token object, but the conditions of policies reference
+                # an unknown userinfo or tokeninfo key, we have a misconfiguration and raise an error.
+                raise PolicyError(u"Unknown key in the {!s} conditions of policy {!r}".format(
+                    type, policy['name']
                 ))
         else:
-            log.warning(u"Policy {!r} has condition on userinfo {!r}, but a user_object is not available".format(
-                policy['name'], key
-            ))
-            # If the policy specifies a userinfo condition, but no user object is available,
+            log.error(u"Policy {!r} has condition on {!s}, but the according object"
+                      u" is not available - possible programming error "
+                      u"{!s}.".format(policy['name'], type, ''.join(traceback.format_stack())))
+            # If the policy specifies a userinfo or tokeninfo condition, but no object is available,
             # the policy is misconfigured. We have to raise a PolicyError to ensure that
             # the privacyIDEA server does not silently misbehave.
             raise PolicyError(
-                u"Policy {!r} has condition on userinfo, but a user_object is not available".format(
-                    policy['name']
+                u"Policy {!r} has condition on {!s}, but an according object is not available".format(
+                    policy['name'], type
                 ))
 
     @staticmethod
@@ -1768,8 +1842,23 @@ def get_static_policy_definitions(scope=None):
                 'desc': _("The Admin is allowed to trigger a challenge for "
                           "e.g. SMS OTP token."),
                 'mainmenu': [],
-                'group': GROUP.GENERAL
-            }
+                'group': GROUP.GENERAL},
+            ACTION.SET_USER_ATTRIBUTES: {
+                'type': TYPE.STRING,
+                'desc': _("The Admin is allowed to set certain custom user "
+                          "attributes. If the Admin should be allowed to set any "
+                          "attribute, set this to '*:*'. For more details, check "
+                          "the documentation."),
+                'mainmenu': [],
+                'group': GROUP.USER},
+            ACTION.DELETE_USER_ATTRIBUTES: {
+                'type': TYPE.STRING,
+                'desc': _("The Admin is allowed to delete certain custom user "
+                          "attributes. If the Admin should be allowed to delete any "
+                          "attribute, set this to '*'. For more details, check "
+                          "the documentation."),
+                'mainmenu': [],
+                'group': GROUP.USER}
         },
 
         SCOPE.USER: {
@@ -1883,7 +1972,23 @@ def get_static_policy_definitions(scope=None):
                                    'desc': _("The user is allowed to do a "
                                              "password reset in an editable "
                                              "UserIdResolver."),
-                                   'mainmenu': []}
+                                   'mainmenu': []},
+            ACTION.SET_USER_ATTRIBUTES: {
+                'type': TYPE.STRING,
+                'desc': _("The user is allowed to set certain custom user "
+                          "attributes. If the user should be allowed to set any "
+                          "attribute, set this to '*:*'. Use '*' with CAUTION! "
+                          "For more details, check the documentation."),
+                'mainmenu': [],
+                'group': GROUP.USER},
+            ACTION.DELETE_USER_ATTRIBUTES: {
+                'type': TYPE.STRING,
+                'desc': _("The user is allowed to delete certain custom user "
+                          "attributes. If the user should be allowed to delete any "
+                          "attribute, set this to '*'. Use '*' with CAUTION! "
+                          "For more details, check the documentation."),
+                'mainmenu': [],
+                'group': GROUP.USER}
 
         },
         SCOPE.ENROLL: {
@@ -2280,6 +2385,11 @@ def get_static_policy_definitions(scope=None):
                 'desc': _("If this is checked, the seed "
                           "will be displayed as text during enrollment.")
             },
+            ACTION.SHOW_NODE: {
+                'type': 'bool',
+                'desc': _("If this is checked, the privacyIDEA Node name will be displayed "
+                          "in the menu bar.")
+            },
             ACTION.SHOW_ANDROID_AUTHENTICATOR: {
                 'type': 'bool',
                 'desc': _("If this is checked, the enrollment page for HOTP, "
@@ -2342,6 +2452,12 @@ def get_policy_condition_sections():
     return {
         CONDITION_SECTION.USERINFO: {
             "description": _("The policy only matches if certain conditions on the user info are fulfilled.")
+        },
+        CONDITION_SECTION.TOKEN: {
+            "description": _("The policy only matches if certain conditions of the token attributes are fulfilled.")
+        },
+        CONDITION_SECTION.TOKENINFO: {
+            "description": _("The policy only matches if certain conditions on the token info are fulfilled.")
         },
         CONDITION_SECTION.HTTP_REQUEST_HEADER: {
             "description": _("The policy only matches if certain conditions on the HTTP Request header are fulfilled.")
@@ -2519,7 +2635,7 @@ class Match(object):
         return cls(g, name=None, scope=scope, realm=realm, active=True,
                    resolver=None, user=None, user_object=None,
                    client=g.client_ip, action=action, adminrealm=None, time=None,
-                   sort_by_priority=True)
+                   sort_by_priority=True, serial=g.serial)
 
     @classmethod
     def user(cls, g, scope, action, user_object):
@@ -2545,7 +2661,7 @@ class Match(object):
         return cls(g, name=None, scope=scope, realm=None, active=True,
                    resolver=None, user=None, user_object=user_object,
                    client=g.client_ip, action=action, adminrealm=None, time=None,
-                   sort_by_priority=True)
+                   sort_by_priority=True, serial=g.serial)
 
     @classmethod
     def token(cls, g, scope, action, token_obj):
@@ -2600,7 +2716,7 @@ class Match(object):
         return cls(g, name=None, scope=SCOPE.ADMIN, user_object=user_obj, active=True,
                    resolver=None, client=g.client_ip, action=action,
                    adminuser=adminuser, adminrealm=adminrealm, time=None,
-                   sort_by_priority=True)
+                   sort_by_priority=True, serial=g.serial)
 
     @classmethod
     def admin_or_user(cls, g, action, user_obj):
@@ -2633,12 +2749,12 @@ class Match(object):
         return cls(g, name=None, scope=scope, realm=userrealm, active=True,
                    resolver=None, user=username, user_object=user_obj,
                    client=g.client_ip, action=action, adminrealm=adminrealm, adminuser=adminuser,
-                   time=None, sort_by_priority=True)
+                   time=None, sort_by_priority=True, serial=g.serial)
 
     @classmethod
     def generic(cls, g, scope=None, realm=None, resolver=None, user=None, user_object=None,
                 client=None, action=None, adminrealm=None, adminuser=None, time=None,
-                active=True, sort_by_priority=True):
+                active=True, sort_by_priority=True, serial=None):
         """
         Low-level legacy policy matching interface: Search for active policies and return
         them sorted by priority. All parameters that should be used for matching have to
@@ -2650,11 +2766,45 @@ class Match(object):
         """
         if client is None:
             client = g.client_ip if hasattr(g, "client_ip") else None
+        if serial is None:
+            serial = g.serial if hasattr(g, "serial") else None
         return cls(g, name=None, scope=scope, realm=realm, active=active,
                    resolver=resolver, user=user, user_object=user_object,
                    client=client, action=action, adminrealm=adminrealm,
-                   adminuser=adminuser, time=time,
+                   adminuser=adminuser, time=time, serial=serial,
                    sort_by_priority=sort_by_priority)
+
+
+def get_allowed_custom_attributes(g, user_obj):
+    """
+    Return the list off allowed custom user attributes that can be set
+    and deleted.
+    Returns a dictionary with the two keys "delete" and "set.
+
+    :param g:
+    :param user_obj: The User object to check the allowed attributes for
+    :return: dict
+    """
+    deleteables = []
+    setables = {}
+    del_pol_dict = Match.admin_or_user(g, action=ACTION.DELETE_USER_ATTRIBUTES,
+                                       user_obj=user_obj).action_values(unique=False,
+                                                                        allow_white_space_in_action=True)
+    for keys in del_pol_dict:
+        deleteables.extend([k.strip() for k in keys.strip().split()])
+    deleteables = list(set(deleteables))
+    set_pol_dict = Match.admin_or_user(g, action=ACTION.SET_USER_ATTRIBUTES,
+                                       user_obj=user_obj).action_values(unique=False,
+                                                                        allow_white_space_in_action=True)
+    for keys in set_pol_dict:
+        # parse through each policy
+        d = parse_string_to_dict(keys)
+        for k, vals in d.items():
+            setables.setdefault(k, []).extend(vals)
+            # If there are double entries in vals, we reduce them to one
+            setables[k] = list(set(setables[k]))
+
+    return {"delete": deleteables, "set": setables}
 
 
 def check_pin(g, pin, tokentype, user_obj):

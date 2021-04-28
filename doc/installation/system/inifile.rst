@@ -113,7 +113,7 @@ to the audit log using the variable ``PI_AUDIT_SERVERNAME``.
 You can run the database for the audit module on another database or even
 server. For this you can specify the database URI via ``PI_AUDIT_SQL_URI``.
 
-``PI_AUDIT_TRUNCATE = True`` lets you truncate audit entries, that to the length
+``PI_AUDIT_SQL_TRUNCATE = True`` lets you truncate audit entries to the length
 of the database fields.
 
 In certain cases when you experiencing problems you may use the parameters
@@ -215,4 +215,24 @@ you need to specify a list of your 3rd party token class modules
 in ``pi.cfg`` using the parameter ``PI_TOKEN_MODULES``:
 
     PI_TOKEN_MODULES = [ "myproject.cooltoken", "myproject.lametoken" ]
+
+.. _custom_web_ui:
+
+Custom Web UI
+-------------
+
+The Web UI is a single page application, that is initiated from the file
+``static/templates/index.html``. This file pulls all CSS, the javascript framework
+and all the javascript business logic.
+
+You can configure privacyIDEA to use your own WebUI, which is completely different and stored at another location.
+
+You can do this using the following config values:
+
+    PI_INDEX_HTML = "myindex.html"
+    PI_STATIC_FOLDER = "mystatic"
+    PI_TEMPLATE_FOLDER = "mystatic/templates"
+
+In this example the file ``mystatic/templates/myindex.html`` would be loaded
+as the initial single page application.
 

@@ -98,7 +98,7 @@ from privacyidea.api.lib.prepolicy import (prepolicy, check_base_action,
                                            check_admin_tokenlist,
                                            indexedsecret_force_attribute,
                                            check_admin_tokenlist, webauthntoken_enroll, webauthntoken_allowed,
-                                           webauthntoken_request)
+                                           webauthntoken_request, required_piv_attestation)
 from privacyidea.api.lib.postpolicy import (save_pin_change,
                                             postpolicy)
 from privacyidea.lib.event import event
@@ -145,6 +145,7 @@ To see how to authenticate read :ref:`rest_auth`.
 @prepolicy(webauthntoken_allowed, request)
 @prepolicy(webauthntoken_request, request)
 @prepolicy(webauthntoken_enroll, request)
+@prepolicy(required_piv_attestation, request)
 @postpolicy(save_pin_change, request)
 @CheckSubscription(request)
 @event("token_init", request, g)
@@ -920,7 +921,6 @@ def loadtokens_api(filename=None):
     known_types = ['aladdin-xml', 'oathcsv', "OATH CSV", 'yubikeycsv',
                    'Yubikey CSV', 'pskc']
     file_type = getParam(request.all_data, "type", required)
-    hashlib = getParam(request.all_data, "aladdin_hashlib")
     aes_validate_mac = getParam(request.all_data, "pskcValidateMAC", default='check_fail_hard')
     aes_psk = getParam(request.all_data, "psk")
     aes_password = getParam(request.all_data, "password")
@@ -989,8 +989,7 @@ def loadtokens_api(filename=None):
 
         import_token(serial,
                      TOKENS[serial],
-                     tokenrealms=tokenrealms,
-                     default_hashlib=hashlib)
+                     tokenrealms=tokenrealms)
 
     g.audit_object.log({'info': u"{0!s}, {1!s} (imported: {2:d})".format(file_type,
                                                            token_file,

@@ -78,7 +78,7 @@ from privacyidea.lib.user import (get_user_from_param, get_default_realm,
 from privacyidea.lib.token import (get_tokens, get_realms_of_token, get_token_type, get_token_owner)
 from privacyidea.lib.utils import (parse_timedelta, is_true, generate_charlists_from_pin_policy,
                                    check_pin_contents, get_module_class,
-                                   determine_logged_in_userparams)
+                                   determine_logged_in_userparams, parse_string_to_dict)
 from privacyidea.lib.crypto import generate_password
 from privacyidea.lib.auth import ROLE
 from privacyidea.api.lib.utils import getParam, attestation_certificate_allowed, is_fqdn
@@ -896,6 +896,65 @@ def required_email(request=None, action=None):
                                     "register!")
 
     return True
+
+
+def check_custom_user_attributes(request=None, action=None):
+    """
+    This pre condition checks for the policies delete_custom_user_attributes and
+    set_custom_user_attributes, if the user or admin is allowed to set or deleted
+    the requested attribute.
+
+    It decorates POST /user/attribute and DELETE /user/attribute/...
+
+    :param request: The request that is intercepted during the API call
+    :type request: Request Object
+    :param action: An optional action, (would be set/delete)
+    :return: Raises a PolicyError, if the wrong attribute is given.
+    """
+    ERROR = "You are not allowed to {0!s} the custom user attribute {1!s}!"
+    is_allowed = False
+    if action == "delete":
+        attr_pol_dict = Match.admin_or_user(g, action=ACTION.DELETE_USER_ATTRIBUTES,
+                                            user_obj=request.User).action_values(unique=False,
+                                                                                 allow_white_space_in_action=True)
+        attr_key = request.all_data.get("attrkey")
+        for attr_pol_val in attr_pol_dict:
+            attr_pol_list = [x.strip() for x in attr_pol_val.strip().split() if x]
+            if attr_key in attr_pol_list or "*" in attr_pol_list:
+                is_allowed = True
+                break
+        if is_allowed:
+            g.audit_object.add_policy(attr_pol_dict.get(attr_pol_val))
+        else:
+            raise PolicyError(ERROR.format(action, attr_key))
+    elif action == "set":
+        attr_pol_dict = Match.admin_or_user(g, action=ACTION.SET_USER_ATTRIBUTES,
+                                            user_obj=request.User).action_values(unique=False,
+                                                                                 allow_white_space_in_action=True)
+        attr_key = request.all_data.get("key")
+        attr_value = request.all_data.get("value")
+        for pol_string in attr_pol_dict:
+            pol_dict = parse_string_to_dict(pol_string)
+            if attr_value in pol_dict.get(attr_key, []):
+                # It is allowed to set the key to this value
+                is_allowed = True
+                break
+            if attr_value in pol_dict.get("*", []):
+                # this value can be set in any key
+                is_allowed = True
+                break
+            if "*" in pol_dict.get(attr_key, []):
+                # This key can be set to any value
+                is_allowed = True
+                break
+            if "*" in pol_dict.get("*", []):
+                # Any key can be set to any value
+                is_allowed = True
+                break
+        if is_allowed:
+            g.audit_object.add_policy(attr_pol_dict.get(pol_string))
+        else:
+            raise PolicyError(ERROR.format(action, attr_key))
 
 
 def auditlog_age(request=None, action=None):
@@ -1998,3 +2057,34 @@ def _attestation_certificate_allowed(attestation_cert, allowed_certs_pols):
         else None
 
     return attestation_certificate_allowed(cert_info, allowed_certs_pols)
+
+
+def required_piv_attestation(request, action=None):
+    """
+    This is a token specific decorator for certificate tokens for the endpoint
+    /token/init
+    According to the policy scope=SCOPE.ENROLL,
+    action=REQUIRE_ATTESTATION an exception is raised, if no attestation parameter is given.
+
+    It also checks the policy if the attestation should be verified and sets the
+    parameter verify_attestation accordingly.
+
+    :param request:
+    :param action:
+    :return:
+    """
+    from privacyidea.lib.tokens.certificatetoken import ACTION, REQUIRE_ACTIONS
+    ttype = request.all_data.get("type")
+    if ttype and ttype.lower() == "certificate":
+        # Get attestation certificate requirement
+        require_att = Match.user(g, scope=SCOPE.ENROLL, action=ACTION.REQUIRE_ATTESTATION,
+                                     user_object=request.User if request.User else None).action_values(unique=True)
+        if REQUIRE_ACTIONS.REQUIRE_AND_VERIFY in list(require_att):
+            if not request.all_data.get("attestation"):
+                # There is no attestation certificate in the request, although it is required!
+                log.warning("The request is missing an attestation certificate. {0!s}".format(require_att))
+                raise PolicyError("A policy requires that you provide an attestation certificate.")
+
+        # Add parameter verify_attestation
+        request.all_data["verify_attestation"] = REQUIRE_ACTIONS.VERIFY in list(require_att) or \
+                                                 REQUIRE_ACTIONS.REQUIRE_AND_VERIFY in list(require_att)
